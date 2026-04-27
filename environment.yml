@@ -1,0 +1,41 @@
+name: sair-oracle
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  # Core scientific
+  - numpy
+  - pandas
+  - pyarrow
+  - scikit-learn
+  - scipy
+  # PyTorch - conda-forge handles MPS on Apple Silicon
+  - pytorch>=2.2
+  - torchvision
+  # Chemistry
+  - rdkit
+  # Jupyter
+  - jupyter
+  - ipykernel
+  - matplotlib
+  - seaborn
+  - pip:
+    # PyTorch Geometric (install via pip after torch)
+    - torch-geometric
+    # ESM2
+    - fair-esm
+    # HuggingFace
+    - huggingface_hub
+    - datasets
+    # Config & logging
+    - pyyaml
+    - wandb
+    - tqdm
+    # Dev
+    - pytest
+    - black
+    - ruff
