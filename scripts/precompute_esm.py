@@ -13,12 +13,18 @@ Usage:
         --device auto
 
 Estimated runtime (650M model):
-    - Apple M4 Max (MPS): ~1-2 hours
-    - Colab A100: ~15-20 minutes
+    - Apple M4 Max (MPS): ~15-20 minutes
+    - Colab A100: ~10-15 minutes
 """
 
 import argparse
 import os
+
+# Must be set before torch is imported — MPS reads this at backend init.
+# 0.0 disables the memory pool high-watermark, forcing MPS to release GPU
+# memory aggressively. Prevents the GPU from starving WindowServer under load.
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+
 from pathlib import Path
 
 import pandas as pd
@@ -160,6 +166,11 @@ def main():
                     torch.save(embeddings[label], output_dir / f"{label}.pt")
                 except RuntimeError:
                     print(f"  Skipping {label} (seq len {len(seq)}): still OOM")
+        finally:
+            # Release MPS memory after every batch so the GPU doesn't accumulate
+            # a large pool that starves WindowServer under sustained load.
+            if device.type == "mps":
+                torch.mps.empty_cache()
 
     print(f"\nDone. Embeddings saved to {output_dir}")
     print(f"Total files: {len(list(output_dir.glob('*.pt'))):,}")

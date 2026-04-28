@@ -33,6 +33,7 @@ build/
 
 # Wandb
 wandb/
+.netrc
 
 # Temp
 /tmp/

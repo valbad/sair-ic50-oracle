@@ -15,8 +15,13 @@ Key design decisions baked in:
 from __future__ import annotations
 
 import argparse
+import gc
+import os
 import sys
 from pathlib import Path
+
+# Must be set before torch is imported — MPS reads this at backend init.
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 
 import torch
 import torch.nn as nn
@@ -150,7 +155,7 @@ def validate(
 
 # ── Training loop ──────────────────────────────────────────────────────────────
 
-def train(config: dict) -> None:
+def train(config: dict, resume: str | None = None) -> None:
     paths = config["paths"]
     data_cfg = config["data"]
     train_cfg = config["training"]
@@ -215,6 +220,34 @@ def train(config: dict) -> None:
 
     grad_clip = train_cfg.get("grad_clip", 0.0)
 
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    start_epoch = 1
+    best_spearman = -float("inf")
+    epochs_without_improvement = 0
+    global_step = 0
+
+    if resume:
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_spearman = ckpt.get("best_spearman", ckpt.get("val_spearman", -float("inf")))
+        epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
+        global_step = ckpt.get("global_step", ckpt["epoch"] * len(train_loader))
+
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        else:
+            # Old checkpoint without optimizer state — fast-forward scheduler
+            # so the LR is approximately correct for the resumed epoch.
+            for _ in range(global_step):
+                scheduler.step()
+            print(f"  Scheduler fast-forwarded to step {global_step} (no optimizer state in checkpoint)")
+
+        print(f"Resumed from {resume} — epoch {ckpt['epoch']}  "
+              f"val_spearman={ckpt.get('val_spearman', '?'):.4f}  "
+              f"continuing from epoch {start_epoch}")
+
     # ── Wandb (optional) ──────────────────────────────────────────────────────
     use_wandb = False
     if log_cfg.get("wandb_project"):
@@ -233,15 +266,11 @@ def train(config: dict) -> None:
     ckpt_dir = Path(paths["checkpoints"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    best_spearman = -float("inf")
-    epochs_without_improvement = 0
     patience = train_cfg["patience"]
-
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    global_step = 0
     log_every = log_cfg.get("log_every_n_steps", 50)
 
-    for epoch in range(1, train_cfg["epochs"] + 1):
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    for epoch in range(start_epoch, train_cfg["epochs"] + 1):
         model.train()
         epoch_loss = 0.0
 
@@ -281,6 +310,11 @@ def train(config: dict) -> None:
             global_step += 1
             pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
+            # Flush MPS memory pool every 200 steps to prevent unified memory
+            # accumulation that causes the OS to kill the process.
+            if device.type == "mps" and global_step % 200 == 0:
+                torch.mps.empty_cache()
+
             if use_wandb and global_step % log_every == 0:
                 import wandb
                 wandb.log({
@@ -292,6 +326,8 @@ def train(config: dict) -> None:
 
         # ── Validation ────────────────────────────────────────────────────────
         metrics = validate(model, val_loader, device, use_amp, autocast_kwargs)
+        if device.type == "mps":
+            torch.mps.empty_cache()
 
         print(
             f"Epoch {epoch:3d} | train_loss={avg_train_loss:.4f} | "
@@ -317,8 +353,13 @@ def train(config: dict) -> None:
             ckpt_path = ckpt_dir / "best.pt"
             torch.save({
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "config": config,
                 "epoch": epoch,
+                "global_step": global_step,
+                "best_spearman": best_spearman,
+                "epochs_without_improvement": 0,
                 "val_spearman": metrics["spearman"],
                 "val_mae": metrics["mae"],
             }, ckpt_path)
@@ -329,11 +370,18 @@ def train(config: dict) -> None:
                 print(f"Early stopping after {patience} epochs without improvement.")
                 break
 
+        gc.collect()
+
     # Save final checkpoint regardless
     torch.save({
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "config": config,
         "epoch": epoch,
+        "global_step": global_step,
+        "best_spearman": best_spearman,
+        "epochs_without_improvement": epochs_without_improvement,
         "val_spearman": metrics["spearman"],
         "val_mae": metrics["mae"],
     }, ckpt_dir / "last.pt")
@@ -351,10 +399,12 @@ def train(config: dict) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Train the SAIR IC50 oracle.")
     parser.add_argument("--config", type=str, default="config/default.yaml")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from (e.g. checkpoints/best.pt)")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    train(config)
+    train(config, resume=args.resume)
 
 
 if __name__ == "__main__":

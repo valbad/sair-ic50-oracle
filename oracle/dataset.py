@@ -91,7 +91,10 @@ class SAIRDataset(Dataset):
               f"(dropped {before-len(df):,})")
 
         if entry_ids is not None:
-            df = df[df["entry_id"].isin(entry_ids)]
+            # Cast to match the parquet's entry_id dtype (int64) — split files
+            # store IDs as strings, so a naive isin gives zero matches.
+            typed_ids = pd.array(entry_ids, dtype=df["entry_id"].dtype)
+            df = df[df["entry_id"].isin(typed_ids)]
 
         # ── Deduplication ─────────────────────────────────────────────────────
         if deduplicate:
