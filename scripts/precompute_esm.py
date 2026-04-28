@@ -78,6 +78,13 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument(
+        "--annotations",
+        type=str,
+        default=None,
+        help="Path to long_protein_annotations.csv. If provided, only embed "
+             "proteins marked keep=True.",
+    )
+    parser.add_argument(
         "--max-seq-len",
         type=int,
         default=1022,
@@ -104,6 +111,12 @@ def main():
         .reset_index(drop=True)
     )
     print(f"Unique proteins: {len(proteins):,}")
+
+    if args.annotations:
+        ann = pd.read_csv(args.annotations)
+        keep = set(ann[ann["keep"] == True]["protein"])
+        proteins = proteins[proteins["protein"].isin(keep)].reset_index(drop=True)
+        print(f"After annotation filter: {len(proteins):,} proteins to embed")
 
     # Skip already computed
     already_done = {p.stem for p in output_dir.glob("*.pt")}

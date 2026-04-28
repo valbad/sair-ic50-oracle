@@ -1,0 +1,47 @@
+paths:
+  parquet:      "~/Library/CloudStorage/GoogleDrive-badea3889@gmail.com/My Drive/sair-data/sair.parquet"
+  esm_cache:    "~/Library/CloudStorage/GoogleDrive-badea3889@gmail.com/My Drive/sair-data/esm_embeddings/"
+  annotations:  "data/long_protein_annotations.csv"
+  splits:       "data/splits/"
+  checkpoints:  "checkpoints/"
+
+data:
+  filter_all_passed: true
+  assay_filter:      "biochem"
+  deduplicate:       true
+
+esm:
+  model_name:  "esm2_t33_650M_UR50D"
+  esm_dim:     1280    # output dim of 650M model; use 480 for 150M
+  hidden_dim:  256     # projection output dim (only used if project=true)
+  project:     false   # set true to add MLP projection before fusion
+
+ligand_gnn:
+  node_dim:   14       # ATOM_FEATURE_DIM — do not change without updating featurise.py
+  edge_dim:   3        # BOND_FEATURE_DIM — do not change without updating featurise.py
+  hidden_dim: 256
+  n_layers:   4
+  dropout:    0.1
+
+model:
+  fusion_hidden_dim: 512
+  dropout:           0.1
+
+training:
+  batch_size:      256
+  epochs:          50
+  learning_rate:   1.0e-4
+  weight_decay:    1.0e-5
+  scheduler:       "cosine"    # "cosine" (per-step) or "plateau" (per-epoch on val loss)
+  huber_delta:     1.0
+  ranking_loss:    true
+  ranking_weight:  0.1
+  ranking_margin:  0.5
+  patience:        10          # early stopping epochs without val Spearman improvement
+  grad_clip:       1.0         # max gradient norm (0 to disable)
+  mixed_precision: false       # torch.autocast — MPS has partial float16 support
+
+logging:
+  wandb_project:     "sair-ic50-oracle"
+  wandb_entity:      null      # set to your wandb username
+  log_every_n_steps: 50

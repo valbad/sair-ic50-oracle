@@ -110,7 +110,7 @@ def assign_splits(
     seed: int = 42,
 ) -> dict[str, str]:
     rng = np.random.default_rng(seed)
-    reps = clusters["representative"].unique()
+    reps = np.array(clusters["representative"].unique())  # force numpy for shuffle
     rng.shuffle(reps)
 
     n = len(reps)

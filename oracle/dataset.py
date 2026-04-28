@@ -14,66 +14,8 @@ from typing import Optional
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from torch_geometric.data import Data
 
-from rdkit import Chem
-
-
-# ── Atom & bond featurisation ──────────────────────────────────────────────────
-
-ATOM_SYMBOLS = ["C", "N", "O", "S", "F", "P", "Cl", "Br", "I", "other"]
-
-
-def one_hot(value, choices: list) -> list[int]:
-    return [int(value == c) for c in choices]
-
-
-def atom_features(atom) -> list[float]:
-    """14-dimensional atom feature vector."""
-    symbol = atom.GetSymbol()
-    return (
-        one_hot(symbol if symbol in ATOM_SYMBOLS[:-1] else "other", ATOM_SYMBOLS)
-        + [atom.GetFormalCharge()]
-        + [atom.GetTotalNumHs()]
-        + [float(atom.GetIsAromatic())]
-        + [atom.GetMass() / 100.0]
-    )
-
-
-def bond_features(bond) -> list[float]:
-    """3-dimensional bond feature vector."""
-    return [
-        bond.GetBondTypeAsDouble() / 3.0,
-        float(bond.GetIsConjugated()),
-        float(bond.IsInRing()),
-    ]
-
-
-def smiles_to_graph(smiles: str) -> Optional[Data]:
-    """Convert a SMILES string to a PyG Data object. Returns None if invalid."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-
-    x = torch.tensor(
-        [atom_features(a) for a in mol.GetAtoms()], dtype=torch.float
-    )
-
-    edge_index, edge_attr = [], []
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        feat = bond_features(bond)
-        edge_index += [[i, j], [j, i]]
-        edge_attr += [feat, feat]
-
-    if len(edge_index) == 0:
-        edge_index = [[0, 0]]
-        edge_attr = [[0.0, 0.0, 0.0]]
-
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    edge_attr = torch.tensor(edge_attr, dtype=torch.float)
-
-    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+from oracle.featurise import smiles_to_graph, fallback_graph, ATOM_FEATURE_DIM
 
 
 # ── Protein filter ─────────────────────────────────────────────────────────────
@@ -181,18 +123,12 @@ class SAIRDataset(Dataset):
         protein_emb = torch.load(emb_path, weights_only=True)  # [D]
 
         # ── Ligand graph ──────────────────────────────────────────────────────
-        graph = smiles_to_graph(row["SMILES"])
-        if graph is None:
-            graph = Data(
-                x=torch.zeros(1, 14),
-                edge_index=torch.zeros(2, 1, dtype=torch.long),
-                edge_attr=torch.zeros(1, 3),
-            )
+        graph = smiles_to_graph(row["SMILES"]) or fallback_graph()
 
         # ── Label ─────────────────────────────────────────────────────────────
         pic50 = torch.tensor(float(row["pIC50"]), dtype=torch.float)
 
-        return protein_emb, graph, pic50
+        return protein_emb, graph, pic50, row["protein"]
 
     # ── Utility ───────────────────────────────────────────────────────────────
 

@@ -1,0 +1,39 @@
+# Data — never commit large binary files or raw datasets
+*.parquet
+*.h5
+*.hdf5
+data/esm_embeddings/
+checkpoints/
+
+# Project planning doc — kept locally, not versioned
+ORACLE_README_v2.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment
+.env
+*.env
+.venv/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Wandb
+wandb/
+
+# Temp
+/tmp/
+*.tmp
