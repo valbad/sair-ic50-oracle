@@ -2,7 +2,9 @@
 *.parquet
 *.h5
 *.hdf5
+*.pt
 data/esm_embeddings/
+data/esm_residue_embeddings/
 checkpoints/
 
 # Project planning doc — kept locally, not versioned

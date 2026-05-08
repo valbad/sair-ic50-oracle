@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 from rdkit import Chem
+from rdkit.Chem import Descriptors, QED
 from torch_geometric.data import Data
 
 
@@ -21,6 +22,11 @@ ATOM_SYMBOLS = ["C", "N", "O", "S", "F", "P", "Cl", "Br", "I", "other"]
 # 10 symbol one-hot + 1 formal charge + 1 H count + 1 aromaticity + 1 mass/100
 ATOM_FEATURE_DIM = 14
 BOND_FEATURE_DIM = 3
+
+# 12 global physicochemical descriptors — GNN-local message-passing can't encode these
+DESCRIPTOR_DIM = 12
+# Fixed normalisation scales (typical drug-like ranges); clamp applied after
+_DESCRIPTOR_SCALES = [500.0, 5.0, 140.0, 10.0, 5.0, 10.0, 6.0, 1.0, 50.0, 1.0, 5.0, 4.0]
 
 
 # ── Atom features ──────────────────────────────────────────────────────────────
@@ -126,6 +132,49 @@ def smiles_to_graph(smiles: str) -> Optional[Data]:
     """Convenience wrapper for training on SMILES strings from the parquet."""
     mol = Chem.MolFromSmiles(smiles)
     return mol_to_graph(mol)
+
+
+# ── Global physicochemical descriptors ────────────────────────────────────────
+
+def mol_to_descriptors(mol: Chem.Mol) -> torch.Tensor:
+    """
+    12-dimensional physicochemical descriptor vector, fixed-scale normalised.
+
+    Descriptors (in order):
+        MolWt /500, MolLogP /5, TPSA /140, NumHAcceptors /10, NumHDonors /5,
+        NumRotatableBonds /10, RingCount /6, FractionCSP3 (0-1),
+        HeavyAtomCount /50, QED (0-1), NumAromaticRings /5, NumSaturatedRings /4
+
+    Values are clamped to [-3, 3] after scaling to handle edge cases.
+    Returns zeros on failure (None mol, sanitisation error, etc.).
+    """
+    if mol is None:
+        return torch.zeros(DESCRIPTOR_DIM)
+    try:
+        raw = [
+            Descriptors.MolWt(mol),
+            Descriptors.MolLogP(mol),
+            Descriptors.TPSA(mol),
+            Descriptors.NumHAcceptors(mol),
+            Descriptors.NumHDonors(mol),
+            Descriptors.NumRotatableBonds(mol),
+            Descriptors.RingCount(mol),
+            Descriptors.FractionCSP3(mol),
+            Descriptors.HeavyAtomCount(mol),
+            QED.qed(mol),
+            Descriptors.NumAromaticRings(mol),
+            Descriptors.NumSaturatedRings(mol),
+        ]
+        scaled = [v / s for v, s in zip(raw, _DESCRIPTOR_SCALES)]
+        return torch.tensor(scaled, dtype=torch.float).clamp(-3.0, 3.0)
+    except Exception:
+        return torch.zeros(DESCRIPTOR_DIM)
+
+
+def smiles_to_descriptors(smiles: str) -> torch.Tensor:
+    """Convenience wrapper for computing descriptors from a SMILES string."""
+    mol = Chem.MolFromSmiles(smiles)
+    return mol_to_descriptors(mol)
 
 
 def fallback_graph() -> Data:
