@@ -5,7 +5,7 @@ paths:
   ligand_cache:   "data/ligand_cache.pt"
   annotations:    "data/long_protein_annotations.csv"
   splits:         "data/splits/"
-  checkpoints:    "checkpoints/"
+  checkpoints:    "checkpoints/baseline/"
 
 data:
   filter_all_passed: true
