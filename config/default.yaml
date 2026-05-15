@@ -1,11 +1,11 @@
 paths:
-  parquet:        "data/sair.parquet"
-  esm_cache:      "data/esm_embeddings/"
-  residue_cache:  null
-  ligand_cache:   "data/ligand_cache.pt"
-  annotations:    "data/long_protein_annotations.csv"
-  splits:         "data/splits/"
-  checkpoints:    "checkpoints/baseline/"
+  parquet:         "data/sair.parquet"
+  esm_cache:       "data/esm_embeddings/"
+  residue_cache:   null
+  chem_emb_cache:  "data/chem_emb_cache.pt"
+  annotations:     "data/long_protein_annotations.csv"
+  splits:          "data/splits/"
+  checkpoints:     "checkpoints/chemberta/"
 
 data:
   filter_all_passed: true
@@ -15,22 +15,26 @@ data:
 esm:
   model_name:   "esm2_t33_650M_UR50D"
   esm_dim:      1280   # output dim of 650M model; use 480 for 150M
-  attn_dim:     256    # cross-attention projection dim (keys/queries/values)
-  max_residues: 1022   # ESM2 hard limit — load full sequence, no artificial truncation
+  attn_dim:     256    # cross-attention projection dim
+  max_residues: 1022   # ESM2 hard limit
 
-ligand_gnn:
-  node_dim:      14    # ATOM_FEATURE_DIM — do not change without updating featurise.py
-  edge_dim:      3     # BOND_FEATURE_DIM — do not change without updating featurise.py
-  hidden_dim:    256
-  n_layers:      4
-  dropout:       0.1
-  descriptor_dim: 12   # DESCRIPTOR_DIM — global RDKit physicochemical features
+chem_encoder:
+  model_name:  "seyonec/ChemBERTa-zinc-base-v1"
+  chem_dim:    768    # ChemBERTa CLS token dim
+  proj_dim:    256    # projected dim for fusion
+  dropout:     0.1
+
+protein_family:
+  n_families:  6      # kinase, enzyme, GPCR, nuclear receptor, phosphatase, other
+  embed_dim:   16
 
 model:
   fusion_hidden_dim: 512
   dropout:           0.1
 
 training:
+  normalize_targets: false   # per-protein zero-mean/unit-std normalization; false = raw pIC50
+  checkpoint_monitor: "spearman"   # "spearman" (stable, 41k samples) or "per_protein_spearman"
   batch_size:      128
   epochs:          50
   learning_rate:   1.0e-4

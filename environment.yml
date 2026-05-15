@@ -15,7 +15,6 @@ dependencies:
   - scipy
   # PyTorch - conda-forge handles MPS on Apple Silicon
   - pytorch>=2.2
-  - torchvision
   # Chemistry
   - rdkit
   # Jupyter
@@ -31,6 +30,7 @@ dependencies:
     # HuggingFace
     - huggingface_hub
     - datasets
+    - transformers>=4.40,<5.0   # 5.x requires torch>=2.6; pin to 4.x for torch 2.5
     # Config & logging
     - pyyaml
     - wandb

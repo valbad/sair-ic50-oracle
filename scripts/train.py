@@ -5,13 +5,16 @@ Usage:
     python scripts/train.py --config config/default.yaml
 
 Key design decisions:
-  - Cross-attention fusion: model(protein_residues, protein_mask, ligand_batch).
-    Residues are padded to batch-max length; mask is True for real residues.
+  - Model predicts normalised pIC50 (per-protein zero-mean / unit-std).
+    All reported metrics (Spearman, MAE) are in raw pIC50 space — validate()
+    denormalises predictions before metric computation.
+  - Ranking loss compares within-protein pairs using normalised targets;
+    ordering is preserved by the monotone normalisation, so ranking loss still
+    measures the same thing as in raw space.
   - protein_ids for ranking loss: collate_fn assigns batch-local integer IDs
     from protein name strings.
-  - Ranking loss active from epoch 0 (ranking_weight in config is the knob).
-  - CosineAnnealingLR stepping per batch (T_max = total training steps).
-  - Metrics reported in raw pIC50 space; MAE is in pIC50 log-units.
+  - Scheduler: CosineAnnealingLR stepping per batch (T_max = total_steps).
+  - Mixed precision: torch.autocast — MPS without explicit dtype, CUDA float16.
 """
 
 from __future__ import annotations
@@ -33,7 +36,6 @@ from scipy.stats import pearsonr, spearmanr
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from torch_geometric.data import Batch
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -47,33 +49,39 @@ from oracle.model import IC50Oracle
 
 def collate_fn(batch: list) -> tuple:
     """
-    Collates (residues, graph, descriptors, pic50, protein_name) tuples.
+    Collates (residues, chem_emb, family_idx, pic50_norm, pic50_raw, protein_name).
 
-    Residue tensors stay float16 and are padded via pad_sequence (C++ loop,
-    no Python intermediates). The GPU-side float32 cast happens inside the
-    model forward pass. Mask is True for valid (non-padding) residues.
+    Residue tensors are padded via pad_sequence; mask is True for valid residues.
+    Returns:
+        padded      [B, L_max, D]  float16
+        prot_mask   [B, L_max]     bool
+        chem_embs   [B, 768]       float32
+        family_idxs [B]            long
+        pic50s_norm [B]            float32  (normalised, for loss)
+        pic50s_raw  [B]            float32  (raw pIC50, for metrics)
+        protein_ids [B]            long     (batch-local IDs, for ranking loss)
+        protein_names tuple[str]            (for per-protein metric grouping)
     """
-    residues_list, graphs, descriptors_list, pic50s, protein_names = zip(*batch)
+    residues_list, chem_embs, family_idxs, pic50s_norm, pic50s_raw, protein_names = zip(*batch)
 
-    # pad_sequence pads float16 tensors to batch-max length in one C++ call.
-    # Avoids the per-sample .float() intermediate that allocates ~5 MB × 128 on CPU.
     padded = torch.nn.utils.rnn.pad_sequence(
         list(residues_list), batch_first=True
     )  # [B, L_max, D] float16
 
     lengths   = torch.tensor([r.shape[0] for r in residues_list])
-    prot_mask = torch.arange(padded.shape[1]).unsqueeze(0) < lengths.unsqueeze(1)  # [B, L_max]
+    prot_mask = torch.arange(padded.shape[1]).unsqueeze(0) < lengths.unsqueeze(1)
 
-    graphs      = Batch.from_data_list(graphs)
-    descriptors = torch.stack(descriptors_list)  # [B, descriptor_dim]
-    pic50s      = torch.stack(pic50s)            # [B]
+    chem_embs   = torch.stack(chem_embs)                          # [B, 768]
+    family_idxs = torch.tensor(family_idxs, dtype=torch.long)    # [B]
+    pic50s_norm = torch.stack(pic50s_norm)                        # [B]
+    pic50s_raw  = torch.stack(pic50s_raw)                         # [B]
 
     unique_names = {name: idx for idx, name in enumerate(dict.fromkeys(protein_names))}
     protein_ids  = torch.tensor(
         [unique_names[n] for n in protein_names], dtype=torch.long
     )
 
-    return padded, prot_mask, graphs, descriptors, pic50s, protein_ids, protein_names
+    return padded, prot_mask, chem_embs, family_idxs, pic50s_norm, pic50s_raw, protein_ids, protein_names
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -113,57 +121,65 @@ def validate(
     device: torch.device,
     use_amp: bool,
     autocast_kwargs: dict,
+    pic50_norms: dict[str, tuple[float, float]],
 ) -> dict:
+    """
+    Evaluate on val_loader.  Predictions are in normalised space; this function
+    denormalises them using pic50_norms before computing all metrics.
+    """
     model.eval()
-    all_preds, all_targets, all_names = [], [], []
+    all_preds_norm, all_targets_raw, all_names = [], [], []
 
-    for residues, prot_mask, graphs, descriptors, pic50s, protein_ids, protein_names in val_loader:
+    for residues, prot_mask, chem_embs, family_idxs, _, pic50s_raw, _, protein_names in val_loader:
         residues    = residues.to(device)
         prot_mask   = prot_mask.to(device)
-        graphs      = graphs.to(device)
-        descriptors = descriptors.to(device)
-        pic50s      = pic50s.to(device)
+        chem_embs   = chem_embs.to(device)
+        family_idxs = family_idxs.to(device)
 
         if use_amp:
             with torch.autocast(**autocast_kwargs):
-                preds = model(residues, prot_mask, graphs, descriptors)
+                preds_norm = model(residues, prot_mask, chem_embs, family_idxs)
         else:
-            preds = model(residues, prot_mask, graphs, descriptors)
+            preds_norm = model(residues, prot_mask, chem_embs, family_idxs)
 
-        all_preds.append(preds.float().cpu())
-        all_targets.append(pic50s.float().cpu())
-        all_names.extend(protein_names)  # strings — stable across batches
+        all_preds_norm.append(preds_norm.float().cpu())
+        all_targets_raw.append(pic50s_raw.float().cpu())
+        all_names.extend(protein_names)
 
-    preds_np   = torch.cat(all_preds).numpy()
-    targets_np = torch.cat(all_targets).numpy()
+    preds_norm_np  = torch.cat(all_preds_norm).numpy()
+    targets_raw_np = torch.cat(all_targets_raw).numpy()
 
-    spearman = spearmanr(preds_np, targets_np).statistic
-    pearson  = pearsonr(preds_np, targets_np)[0]
-    mae      = float(abs(preds_np - targets_np).mean())
+    # Denormalise predictions into raw pIC50 space
+    _fallback = pic50_norms.get("__global__", (0.0, 1.0))
+    means = np.array([pic50_norms.get(n, _fallback)[0] for n in all_names])
+    stds  = np.array([pic50_norms.get(n, _fallback)[1] for n in all_names])
+    preds_raw_np = preds_norm_np * stds + means
 
-    # Group by protein name (string) so IDs are consistent across batches.
-    # Batch-local integer IDs collide across batches and must NOT be used here.
+    # Global metrics in raw pIC50 space
+    spearman = spearmanr(preds_raw_np, targets_raw_np).statistic
+    pearson  = pearsonr(preds_raw_np, targets_raw_np)[0]
+    mae      = float(abs(preds_raw_np - targets_raw_np).mean())
+
+    # Per-protein Spearman (primary deployment metric)
     prot_preds:   dict = defaultdict(list)
     prot_targets: dict = defaultdict(list)
-    for name, p, t in zip(all_names, preds_np, targets_np):
+    for name, p, t in zip(all_names, preds_raw_np, targets_raw_np):
         prot_preds[name].append(p)
         prot_targets[name].append(t)
 
     per_protein_spearmans = []
     for name in prot_preds:
-        if len(prot_preds[name]) >= 5:   # ≥5 samples: Spearman on 2-3 points is pure noise
+        if len(prot_preds[name]) >= 5:
             s = spearmanr(prot_preds[name], prot_targets[name]).statistic
             per_protein_spearmans.append(s)
 
     valid = np.array(per_protein_spearmans, dtype=float)
-    mean_per_protein_spearman = (
-        float(np.nanmean(valid)) if len(valid) > 0 else float("nan")
-    )
+    mean_per_protein_spearman = float(np.nanmean(valid)) if len(valid) > 0 else float("nan")
 
     return {
-        "spearman": float(spearman),
-        "pearson":  float(pearson),
-        "mae":      mae,
+        "spearman":             float(spearman),
+        "pearson":              float(pearson),
+        "mae":                  mae,
         "per_protein_spearman": mean_per_protein_spearman,
     }
 
@@ -192,39 +208,40 @@ def train(config: dict, resume: str | None = None) -> None:
     print(f"Split sizes — train: {len(train_ids):,}  val: {len(val_ids):,}")
 
     # ── Datasets ──────────────────────────────────────────────────────────────
-    residue_cache_dir = paths.get("residue_cache")
-    max_residues      = esm_cfg.get("max_residues", 512)
-
     dataset_kwargs = dict(
-        parquet_path      = paths["parquet"],
-        esm_cache_dir     = paths["esm_cache"],
-        annotations_csv   = paths["annotations"],
-        filter_all_passed = data_cfg["filter_all_passed"],
-        assay_filter      = data_cfg.get("assay_filter"),
-        deduplicate       = data_cfg["deduplicate"],
-        residue_cache_dir = residue_cache_dir,
-        max_residues      = max_residues,
-        ligand_cache_path = paths.get("ligand_cache"),
+        parquet_path        = paths["parquet"],
+        esm_cache_dir       = paths["esm_cache"],
+        annotations_csv     = paths["annotations"],
+        filter_all_passed   = data_cfg["filter_all_passed"],
+        assay_filter        = data_cfg.get("assay_filter"),
+        deduplicate         = data_cfg["deduplicate"],
+        residue_cache_dir   = paths.get("residue_cache"),
+        max_residues        = esm_cfg.get("max_residues", 1022),
+        chem_emb_cache_path = paths.get("chem_emb_cache"),
+        normalize_targets   = train_cfg.get("normalize_targets", True),
     )
 
+    # Each split computes its own per-protein pIC50 normalization stats.
+    # (Protein-cluster splits mean train ≠ val proteins, so train norms
+    # can't be applied to val proteins directly.)
     train_ds = SAIRDataset(entry_ids=train_ids, **dataset_kwargs)
     val_ds   = SAIRDataset(entry_ids=val_ids,   **dataset_kwargs)
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=train_cfg["batch_size"],
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
+        batch_size  = train_cfg["batch_size"],
+        shuffle     = True,
+        num_workers = 0,
+        collate_fn  = collate_fn,
+        pin_memory  = (device.type == "cuda"),
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=train_cfg["batch_size"],
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
-        pin_memory=(device.type == "cuda"),
+        batch_size  = train_cfg["batch_size"],
+        shuffle     = False,
+        num_workers = 0,
+        collate_fn  = collate_fn,
+        pin_memory  = (device.type == "cuda"),
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -234,8 +251,8 @@ def train(config: dict, resume: str | None = None) -> None:
 
     optimizer = AdamW(
         model.parameters(),
-        lr=train_cfg["learning_rate"],
-        weight_decay=train_cfg["weight_decay"],
+        lr           = train_cfg["learning_rate"],
+        weight_decay = train_cfg["weight_decay"],
     )
 
     total_steps = train_cfg["epochs"] * len(train_loader)
@@ -275,9 +292,9 @@ def train(config: dict, resume: str | None = None) -> None:
         try:
             import wandb
             wandb.init(
-                project=log_cfg["wandb_project"],
-                entity=log_cfg.get("wandb_entity"),
-                config=config,
+                project = log_cfg["wandb_project"],
+                entity  = log_cfg.get("wandb_entity"),
+                config  = config,
             )
             use_wandb = True
         except Exception as e:
@@ -296,12 +313,12 @@ def train(config: dict, resume: str | None = None) -> None:
         epoch_loss = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
-        for residues, prot_mask, graphs, descriptors, pic50s, protein_ids, _ in pbar:
+        for residues, prot_mask, chem_embs, family_idxs, pic50s_norm, _, protein_ids, _ in pbar:
             residues    = residues.to(device)
             prot_mask   = prot_mask.to(device)
-            graphs      = graphs.to(device)
-            descriptors = descriptors.to(device)
-            pic50s      = pic50s.to(device)
+            chem_embs   = chem_embs.to(device)
+            family_idxs = family_idxs.to(device)
+            pic50s_norm = pic50s_norm.to(device)
             protein_ids = protein_ids.to(device)
 
             optimizer.zero_grad()
@@ -314,11 +331,11 @@ def train(config: dict, resume: str | None = None) -> None:
             )
             if use_amp:
                 with torch.autocast(**autocast_kwargs):
-                    preds = model(residues, prot_mask, graphs, descriptors)
-                loss = combined_loss(preds.float(), pic50s.float(), protein_ids, **loss_kwargs)
+                    preds = model(residues, prot_mask, chem_embs, family_idxs)
+                loss = combined_loss(preds.float(), pic50s_norm.float(), protein_ids, **loss_kwargs)
             else:
-                preds = model(residues, prot_mask, graphs, descriptors)
-                loss  = combined_loss(preds, pic50s, protein_ids, **loss_kwargs)
+                preds = model(residues, prot_mask, chem_embs, family_idxs)
+                loss  = combined_loss(preds, pic50s_norm, protein_ids, **loss_kwargs)
 
             loss.backward()
 
@@ -346,7 +363,8 @@ def train(config: dict, resume: str | None = None) -> None:
         avg_train_loss = epoch_loss / len(train_loader)
 
         # ── Validation ────────────────────────────────────────────────────────
-        metrics = validate(model, val_loader, device, use_amp, autocast_kwargs)
+        metrics = validate(model, val_loader, device, use_amp, autocast_kwargs,
+                           val_ds.pic50_norms)
         if device.type == "mps":
             torch.mps.empty_cache()
 
@@ -360,32 +378,34 @@ def train(config: dict, resume: str | None = None) -> None:
         if use_wandb:
             import wandb
             wandb.log({
-                "train/epoch_loss":          avg_train_loss,
-                "val/spearman":              metrics["spearman"],
-                "val/pearson":               metrics["pearson"],
-                "val/mae":                   metrics["mae"],
-                "val/per_protein_spearman":  metrics["per_protein_spearman"],
+                "train/epoch_loss":         avg_train_loss,
+                "val/spearman":             metrics["spearman"],
+                "val/pearson":              metrics["pearson"],
+                "val/mae":                  metrics["mae"],
+                "val/per_protein_spearman": metrics["per_protein_spearman"],
             }, step=global_step)
 
         # ── Checkpoint ────────────────────────────────────────────────────────
-        monitor = metrics["per_protein_spearman"]
+        monitor_key = train_cfg.get("checkpoint_monitor", "per_protein_spearman")
+        monitor = metrics[monitor_key]
         if monitor > best_spearman:
             best_spearman = monitor
             epochs_without_improvement = 0
             ckpt_path = ckpt_dir / "best.pt"
             torch.save({
-                "model_state_dict":          model.state_dict(),
-                "optimizer_state_dict":      optimizer.state_dict(),
-                "scheduler_state_dict":      scheduler.state_dict(),
-                "config":                    config,
-                "epoch":                     epoch,
-                "global_step":               global_step,
-                "best_spearman":             best_spearman,
+                "model_state_dict":           model.state_dict(),
+                "optimizer_state_dict":       optimizer.state_dict(),
+                "scheduler_state_dict":       scheduler.state_dict(),
+                "config":                     config,
+                "pic50_norms":                train_ds.pic50_norms,
+                "epoch":                      epoch,
+                "global_step":                global_step,
+                "best_spearman":              best_spearman,
                 "epochs_without_improvement": 0,
-                "val_spearman":              metrics["spearman"],
-                "val_mae":                   metrics["mae"],
+                "val_spearman":               metrics["spearman"],
+                "val_mae":                    metrics["mae"],
             }, ckpt_path)
-            print(f"  Checkpoint saved (per_prot_spearman={best_spearman:.4f})")
+            print(f"  Checkpoint saved ({monitor_key}={best_spearman:.4f})")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
@@ -396,16 +416,17 @@ def train(config: dict, resume: str | None = None) -> None:
 
     # Save final checkpoint
     torch.save({
-        "model_state_dict":          model.state_dict(),
-        "optimizer_state_dict":      optimizer.state_dict(),
-        "scheduler_state_dict":      scheduler.state_dict(),
-        "config":                    config,
-        "epoch":                     epoch,
-        "global_step":               global_step,
-        "best_spearman":             best_spearman,
+        "model_state_dict":           model.state_dict(),
+        "optimizer_state_dict":       optimizer.state_dict(),
+        "scheduler_state_dict":       scheduler.state_dict(),
+        "config":                     config,
+        "pic50_norms":                train_ds.pic50_norms,
+        "epoch":                      epoch,
+        "global_step":                global_step,
+        "best_spearman":              best_spearman,
         "epochs_without_improvement": epochs_without_improvement,
-        "val_spearman":              metrics["spearman"],
-        "val_mae":                   metrics["mae"],
+        "val_spearman":               metrics["spearman"],
+        "val_mae":                    metrics["mae"],
     }, ckpt_dir / "last.pt")
 
     if use_wandb:
@@ -422,7 +443,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train the SAIR IC50 oracle.")
     parser.add_argument("--config", type=str, default="config/default.yaml")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to checkpoint to resume from (e.g. checkpoints/best.pt)")
+                        help="Path to checkpoint to resume from (e.g. checkpoints/baseline/best.pt)")
     args = parser.parse_args()
 
     config = load_config(args.config)

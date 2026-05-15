@@ -11,5 +11,6 @@ from .featurise import (
     DESCRIPTOR_DIM,
     ATOM_SYMBOLS,
 )
+from .chem_encoder import ChemEncoder
 from .model import IC50Oracle
-from .dataset import SAIRDataset
+from .dataset import SAIRDataset, FAMILIES, FAMILY_TO_IDX, N_FAMILIES
